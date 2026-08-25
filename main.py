@@ -618,7 +618,14 @@ bot = HateClanBot()
 @bot.event
 async def on_ready():
     init_db()
-    print(f"Бот {bot.user} успешно запущен!")
+    
+    # Установка активности и статуса бота
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Game(name="Rust | /setup")
+    )
+    
+    print(f"Бот {bot.user} успешно запущен и статус обновлен!")
 
 # --- ТЕКСТОВАЯ АЛЬТЕРНАТИВА И СИНХРОНИЗАЦИЯ ---
 
