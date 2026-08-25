@@ -85,7 +85,6 @@ def init_db():
             clan_role_id INTEGER
         )
     """)
-    # Таблица прав доступа к командам по ролям
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS role_permissions (
             guild_id INTEGER,
@@ -294,14 +293,13 @@ async def check_command_permissions(interaction: discord.Interaction, command_na
     
     allowed_roles = await asyncio.to_thread(db_get_allowed_roles_for_command, interaction.guild_id, command_name)
     if not allowed_roles:
-        # Если права для команды не настроены вручную, доступ закрыт всем кроме администраторов
         return False
     
     user_role_ids = {role.id for role in interaction.user.roles}
     return any(r_id in user_role_ids for r_id in allowed_roles)
 
 # ==============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БИЗНЕС-ЛОГИКИ
 # ==============================================================================
 
 async def get_rust_server_info(ip: str, port: int) -> dict | None:
@@ -381,6 +379,43 @@ async def update_leader_report(guild: discord.Guild, bot: commands.Bot):
                 return
         await channel.send(embed=embed)
 
+async def process_steam_list(interaction: discord.Interaction):
+    steam_data = await asyncio.to_thread(db_get_all_steam_ids)
+    if not steam_data:
+        await interaction.followup.send("❌ В базе данных пока нет привязанных SteamID.", ephemeral=True)
+        return
+
+    lines = [f"<@{discord_id}> — `{steam_id}`" for discord_id, steam_id in steam_data]
+    embed = discord.Embed(title="📋 Список привязанных SteamID клана", description="\n".join(lines)[:1900], color=discord.Color.blue())
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+async def process_notify_no_steam(interaction: discord.Interaction):
+    steam_data = await asyncio.to_thread(db_get_all_steam_ids)
+    linked_ids = {r[0] for r in steam_data}
+
+    config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
+    clan_role_id = config.get("clan_role_id")
+
+    unlinked_mentions = []
+    if clan_role_id:
+        role = interaction.guild.get_role(clan_role_id)
+        if role:
+            for member in role.members:
+                if not member.bot and member.id not in linked_ids:
+                    unlinked_mentions.append(member.mention)
+
+    if unlinked_mentions:
+        msg_text = (
+            "⚠️ **НАПОМИНАНИЕ О ПРИВЯЗКЕ STEAM** ⚠️\n"
+            "Следующие бойцы клана ещё не привязали свой SteamID в боте:\n"
+            + " ".join(unlinked_mentions[:30]) +
+            "\n\nПожалуйста, напишите команду `/link <ваш_steamid_или_ссылка>` прямо сейчас!"
+        )
+        await interaction.channel.send(msg_text)
+        await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
+    else:
+        await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
+
 # ==============================================================================
 # UI И МОДАЛЬНЫЕ ОКНА
 # ==============================================================================
@@ -444,6 +479,7 @@ class AdminWipeModal(discord.ui.Modal, title="📢 Анонс и настрой�
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        global wipe_data
         await interaction.response.defer(ephemeral=True)
         try:
             wipe_dt = datetime.strptime(self.date_time.value, "%d.%m.%Y %H:%M")
@@ -478,7 +514,6 @@ class AdminWipeModal(discord.ui.Modal, title="📢 Анонс и настрой�
         embed.add_field(name="Статус", value="🟡 Ожидание вайпа", inline=True)
         embed.set_footer(text="Выберите ваш статус с помощью кнопок ниже:")
 
-        global wipe_data
         wipe_data = {
             "datetime": wipe_dt,
             "channel_id": interaction.channel_id,
@@ -512,13 +547,11 @@ class AdminWarnLimitModal(discord.ui.Modal, title="⚙️ Настройка л�
         await asyncio.to_thread(db_set_max_warns, interaction.guild_id, max_w)
         await interaction.response.send_message(f"⚙️ Новый лимит варнов для автоматического бана равен `{max_w}`", ephemeral=True)
 
-# ИНТЕРАКТИВНОЕ УПРАВЛЕНИЕ ПРАВАМИ КОМАНД ПО РОЛЯМ
 class CommandRoleManagerView(discord.ui.View):
     def __init__(self, target_role: discord.Role):
         super().__init__(timeout=180)
         self.target_role = target_role
 
-        # Выпадающее меню для выбора команды
         options = [discord.SelectOption(label=cmd, value=cmd) for cmd in ALL_COMMAND_NAMES[:25]]
         self.cmd_select = discord.ui.Select(placeholder="Выберите команду для изменения прав...", options=options)
         self.cmd_select.callback = self.select_callback
@@ -612,49 +645,16 @@ class AdminPanelView(discord.ui.View):
         if not await check_command_permissions(interaction, "steam_list"):
             await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-        steam_data = await asyncio.to_thread(db_get_all_steam_ids)
-        if not steam_data:
-            await interaction.followup.send("❌ В базе данных пока нет привязанных SteamID.", ephemeral=True)
-            return
-
-        lines = [f"<@{discord_id}> — `{steam_id}`" for discord_id, steam_id in steam_data]
-        embed = discord.Embed(title="📋 Список привязанных SteamID клана", description="\n".join(lines)[:1900], color=discord.Color.blue())
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await process_steam_list(interaction)
 
     @discord.ui.button(label="🔔 Пинг без Steam", style=discord.ButtonStyle.danger, custom_id="admin_panel_notify_no_steam", row=1)
     async def notify_no_steam(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await check_command_permissions(interaction, "notify_no_steam"):
             await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
-        steam_data = await asyncio.to_thread(db_get_all_steam_ids)
-        linked_ids = {r[0] for r in steam_data}
-
-        config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
-        clan_role_id = config.get("clan_role_id")
-
-        unlinked_mentions = []
-        if clan_role_id:
-            role = interaction.guild.get_role(clan_role_id)
-            if role:
-                for member in role.members:
-                    if not member.bot and member.id not in linked_ids:
-                        unlinked_mentions.append(member.mention)
-
-        if unlinked_mentions:
-            msg_text = (
-                "⚠️ **НАПОМИНАНИЕ О ПРИВЯЗКЕ STEAM** ⚠️\n"
-                "Следующие бойцы клана ещё не привязали свой SteamID в боте:\n"
-                + " ".join(unlinked_mentions[:30]) +
-                "\n\nПожалуйста, напишите команду `/link <ваш_steamid_или_ссылка>` прямо сейчас!"
-            )
-            await interaction.channel.send(msg_text)
-            await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
-        else:
-            await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
+        await process_notify_no_steam(interaction)
 
     @discord.ui.button(label="⚙️ Настройки сервера", style=discord.ButtonStyle.secondary, custom_id="admin_panel_settings", row=2)
     async def open_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -711,12 +711,11 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Ошибка синхронизации команд: {e}")
 
-# --- ТЕКСТОВАЯ АЛЬТЕРНАТИВА И СИНХРОНИЗАЦИЯ ---
+# --- ТЕКСТОВЫЕ АДМИН-КОМАНДЫ ---
 
 @bot.command(name="admin_panel")
+@commands.has_permissions(administrator=True)
 async def text_admin_panel(ctx: commands.Context):
-    if not ctx.author.guild_permissions.administrator:
-        return
     embed = discord.Embed(
         title="🛠️ ПАНЕЛЬ УПРАВЛЕНИЯ КЛАНОМ HATE",
         description="Используйте кнопки ниже для быстрого управления кланом:",
@@ -793,65 +792,6 @@ async def settings_cmd(interaction: discord.Interaction):
     embed.add_field(name="Лимит варнов для бана", value=f"`{max_warns}`", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="admin_panel", description="Заспавнить интерактивную админ-панель")
-async def admin_panel_cmd(interaction: discord.Interaction):
-    if not await check_command_permissions(interaction, "admin_panel"):
-        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
-        return
-    embed = discord.Embed(
-        title="🛠️ ПАНЕЛЬ УПРАВЛЕНИЯ КЛАНОМ HATE",
-        description="Используйте кнопки ниже для быстрого управления кланом:",
-        color=discord.Color.dark_grey()
-    )
-    await interaction.response.send_message(embed=embed, view=AdminPanelView())
-
-@bot.tree.command(name="steam_list", description="Посмотреть список всех привязанных SteamID")
-async def steam_list(interaction: discord.Interaction):
-    if not await check_command_permissions(interaction, "steam_list"):
-        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    steam_data = await asyncio.to_thread(db_get_all_steam_ids)
-    if not steam_data:
-        await interaction.followup.send("❌ В базе данных пока нет привязанных SteamID.", ephemeral=True)
-        return
-
-    lines = [f"<@{discord_id}> — `{steam_id}`" for discord_id, steam_id in steam_data]
-    embed = discord.Embed(title="📋 Список привязанных SteamID клана", description="\n".join(lines)[:1900], color=discord.Color.blue())
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="notify_no_steam", description="Уведомить игроков с ролью клана, которые ещё не привязали SteamID")
-async def notify_no_steam_cmd(interaction: discord.Interaction):
-    if not await check_command_permissions(interaction, "notify_no_steam"):
-        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    steam_data = await asyncio.to_thread(db_get_all_steam_ids)
-    linked_ids = {r[0] for r in steam_data}
-
-    config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
-    clan_role_id = config.get("clan_role_id")
-
-    unlinked_mentions = []
-    if clan_role_id:
-        role = interaction.guild.get_role(clan_role_id)
-        if role:
-            for member in role.members:
-                if not member.bot and member.id not in linked_ids:
-                    unlinked_mentions.append(member.mention)
-
-    if unlinked_mentions:
-        msg_text = (
-            "⚠️ **НАПОМИНАНИЕ О ПРИВЯЗКЕ STEAM** ⚠️\n"
-            "Следующие бойцы клана ещё не привязали свой SteamID в боте:\n"
-            + " ".join(unlinked_mentions[:30]) +
-            "\n\nПожалуйста, напишите команду `/link <ваш_steamid_или_ссылка>` прямо сейчас!"
-        )
-        await interaction.channel.send(msg_text)
-        await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
-    else:
-        await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
 
 # --- ДИНАМИЧЕСКИЕ ГОЛОСОВЫЕ КАНАЛЫ ---
 
