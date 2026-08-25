@@ -25,6 +25,14 @@ RUST_APP_ID = "252490"
 active_temp_channels = set()
 wipe_data = {}
 
+# Список всех команд бота для настройки прав
+ALL_COMMAND_NAMES = [
+    "admin_panel", "setup", "set_clan_role", "set_leader_channel", 
+    "settings", "steam_list", "notify_no_steam", "voice_setup", 
+    "warn_add", "warn_remove", "warn_list", "warn_clear", "warn_set_limit",
+    "craft", "raid", "profile", "link", "roles_setup"
+]
+
 # ==============================================================================
 # БАЗА ДАННЫХ (SQLite)
 # ==============================================================================
@@ -75,6 +83,15 @@ def init_db():
             guild_id INTEGER PRIMARY KEY,
             leader_channel_id INTEGER,
             clan_role_id INTEGER
+        )
+    """)
+    # Таблица прав доступа к командам по ролям
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS role_permissions (
+            guild_id INTEGER,
+            role_id INTEGER,
+            command_name TEXT,
+            PRIMARY KEY (guild_id, role_id, command_name)
         )
     """)
     conn.commit()
@@ -149,8 +166,6 @@ def db_get_voice_settings(guild_id: int):
     row = cursor.fetchone()
     conn.close()
     return row if row else (None, None)
-
-# --- НАСТРОЙКИ СЕРВЕРА (GUILD CONFIG) ---
 
 def db_set_leader_channel(guild_id: int, channel_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -241,6 +256,49 @@ def db_get_max_warns(guild_id: int) -> int:
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else 3
+
+# --- МЕНЕДЖЕР ПРАВ И РОЛЕЙ (RBAC) ---
+
+def db_add_role_permission(guild_id: int, role_id: int, command_name: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR IGNORE INTO role_permissions (guild_id, role_id, command_name)
+        VALUES (?, ?, ?)
+    """, (guild_id, role_id, command_name))
+    conn.commit()
+    conn.close()
+
+def db_remove_role_permission(guild_id: int, role_id: int, command_name: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM role_permissions WHERE guild_id = ? AND role_id = ? AND command_name = ?
+    """, (guild_id, role_id, command_name))
+    conn.commit()
+    conn.close()
+
+def db_get_allowed_roles_for_command(guild_id: int, command_name: str) -> list[int]:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT role_id FROM role_permissions WHERE guild_id = ? AND command_name = ?
+    """, (guild_id, command_name))
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+async def check_command_permissions(interaction: discord.Interaction, command_name: str) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    
+    allowed_roles = await asyncio.to_thread(db_get_allowed_roles_for_command, interaction.guild_id, command_name)
+    if not allowed_roles:
+        # Если права для команды не настроены вручную, доступ закрыт всем кроме администраторов
+        return False
+    
+    user_role_ids = {role.id for role in interaction.user.roles}
+    return any(r_id in user_role_ids for r_id in allowed_roles)
 
 # ==============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -454,7 +512,31 @@ class AdminWarnLimitModal(discord.ui.Modal, title="⚙️ Настройка л�
         await asyncio.to_thread(db_set_max_warns, interaction.guild_id, max_w)
         await interaction.response.send_message(f"⚙️ Новый лимит варнов для автоматического бана равен `{max_w}`", ephemeral=True)
 
-# ИНТЕРАКТИВНЫЙ ВЫБОР НАСТРОЕК СЕРВЕРА В DISCORD
+# ИНТЕРАКТИВНОЕ УПРАВЛЕНИЕ ПРАВАМИ КОМАНД ПО РОЛЯМ
+class CommandRoleManagerView(discord.ui.View):
+    def __init__(self, target_role: discord.Role):
+        super().__init__(timeout=180)
+        self.target_role = target_role
+
+        # Выпадающее меню для выбора команды
+        options = [discord.SelectOption(label=cmd, value=cmd) for cmd in ALL_COMMAND_NAMES[:25]]
+        self.cmd_select = discord.ui.Select(placeholder="Выберите команду для изменения прав...", options=options)
+        self.cmd_select.callback = self.select_callback
+        self.add_item(self.cmd_select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_cmd = self.cmd_select.values[0]
+        allowed_roles = await asyncio.to_thread(db_get_allowed_roles_for_command, interaction.guild_id, selected_cmd)
+
+        if self.target_role.id in allowed_roles:
+            await asyncio.to_thread(db_remove_role_permission, interaction.guild_id, self.target_role.id, selected_cmd)
+            msg = f"❌ Права на команду `/{selected_cmd}` **отозваны** у роли {self.target_role.mention}."
+        else:
+            await asyncio.to_thread(db_add_role_permission, interaction.guild_id, self.target_role.id, selected_cmd)
+            msg = f"✅ Права на команду `/{selected_cmd}` **предоставлены** роли {self.target_role.mention}."
+
+        await interaction.response.send_message(msg, ephemeral=True)
+
 class SetupSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
@@ -471,21 +553,27 @@ class SetupSelectView(discord.ui.View):
         await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel.id)
         await interaction.response.send_message(f"✅ Канал сводки руководства установлен: {selected_channel.mention}", ephemeral=True)
 
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Настроить доступ к командам для роли...", row=2)
+    async def select_permission_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        target_role = select.values[0]
+        view = CommandRoleManagerView(target_role)
+        await interaction.response.send_message(f"⚙️ Управление правами для роли {target_role.mention}:", view=view, ephemeral=True)
+
 class AdminPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="📢 Анонс Вайпа", style=discord.ButtonStyle.primary, custom_id="admin_panel_wipe", row=0)
     async def create_wipe(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "admin_panel"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
         await interaction.response.send_modal(AdminWipeModal())
 
     @discord.ui.button(label="📊 Сводка Явки", style=discord.ButtonStyle.success, custom_id="admin_panel_report", row=0)
     async def get_report(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "admin_panel"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         embed = await build_report_embed(is_final=False)
@@ -493,8 +581,8 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="📣 Пинать неопределившихся", style=discord.ButtonStyle.secondary, custom_id="admin_panel_ping", row=0)
     async def ping_missing(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "admin_panel"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -521,8 +609,8 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="🆔 Все SteamID", style=discord.ButtonStyle.primary, custom_id="admin_panel_steam_list", row=1)
     async def get_steam_list(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "steam_list"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -537,8 +625,8 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="🔔 Пинг без Steam", style=discord.ButtonStyle.danger, custom_id="admin_panel_notify_no_steam", row=1)
     async def notify_no_steam(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "notify_no_steam"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -566,21 +654,21 @@ class AdminPanelView(discord.ui.View):
             await interaction.channel.send(msg_text)
             await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
         else:
-            await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID (или роль клана не настроена через `/setup`)!", ephemeral=True)
+            await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
 
     @discord.ui.button(label="⚙️ Настройки сервера", style=discord.ButtonStyle.secondary, custom_id="admin_panel_settings", row=2)
     async def open_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "setup"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
         
-        embed = discord.Embed(title="⚙️ Быстрая настройка сервера", description="Выберите параметры ниже:", color=discord.Color.blue())
+        embed = discord.Embed(title="⚙️ Быстрая настройка сервера и прав", description="Выберите параметры ниже:", color=discord.Color.blue())
         await interaction.response.send_message(embed=embed, view=SetupSelectView(), ephemeral=True)
 
     @discord.ui.button(label="⚠️ Лимит Варнов", style=discord.ButtonStyle.secondary, custom_id="admin_panel_warn_limit", row=2)
     async def warn_limit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
+        if not await check_command_permissions(interaction, "warn_set_limit"):
+            await interaction.response.send_message("❌ У вас недостаточно прав!", ephemeral=True)
             return
         await interaction.response.send_modal(AdminWarnLimitModal())
 
@@ -626,8 +714,9 @@ async def on_ready():
 # --- ТЕКСТОВАЯ АЛЬТЕРНАТИВА И СИНХРОНИЗАЦИЯ ---
 
 @bot.command(name="admin_panel")
-@commands.has_permissions(administrator=True)
 async def text_admin_panel(ctx: commands.Context):
+    if not ctx.author.guild_permissions.administrator:
+        return
     embed = discord.Embed(
         title="🛠️ ПАНЕЛЬ УПРАВЛЕНИЯ КЛАНОМ HATE",
         description="Используйте кнопки ниже для быстрого управления кланом:",
@@ -643,35 +732,52 @@ async def manual_sync(ctx: commands.Context):
     synced = await bot.tree.sync(guild=ctx.guild)
     await msg.edit(content=f"✅ Успешно привязано {len(synced)} слэш-команд прямо к этому серверу! Обновите клиенты Discord (CTRL+R).")
 
-# --- СЛЭШ-КОМАНДЫ НАСТРОЙКИ СЕРВЕРА (DISCORD DYNAMIC CONFIG) ---
+# --- СЛЭШ-КОМАНДЫ НАСТРОЙКИ СЕРВЕРА И РОЛЕЙ ---
 
-@bot.tree.command(name="setup", description="Открыть интерактивное меню настройки роли и каналов клана (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="roles_setup", description="Настройка доступа команд для определённой роли (Админ)")
+@app_commands.describe(role="Роль Discord для настройки прав")
+async def roles_setup_cmd(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Только администратор может изменять права команд!", ephemeral=True)
+        return
+    view = CommandRoleManagerView(role)
+    await interaction.response.send_message(f"⚙️ Управление правами на команды для роли {role.mention}:", view=view, ephemeral=True)
+
+@bot.tree.command(name="setup", description="Открыть интерактивное меню настройки роли и каналов клана")
 async def setup_cmd(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "setup"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     embed = discord.Embed(
         title="⚙️ Интерактивная настройка бота HATE",
-        description="Используйте выпадающие меню ниже, чтобы выбрать роль клана и канал для авто-сводки руководства:",
+        description="Используйте выпадающие меню ниже, чтобы выбрать роль клана, права команд и канал для сводки:",
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, view=SetupSelectView(), ephemeral=True)
 
-@bot.tree.command(name="set_clan_role", description="Установить основную роль клана для пингов и отчетов (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="set_clan_role", description="Установить основную роль клана для пингов и отчетов")
 @app_commands.describe(role="Роль вашего клана")
 async def set_clan_role_cmd(interaction: discord.Interaction, role: discord.Role):
+    if not await check_command_permissions(interaction, "set_clan_role"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await asyncio.to_thread(db_set_clan_role, interaction.guild_id, role.id)
     await interaction.response.send_message(f"✅ Роль клана успешно установлена: {role.mention}", ephemeral=True)
 
-@bot.tree.command(name="set_leader_channel", description="Назначить канал для автоматической сводки руководству (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="set_leader_channel", description="Назначить канал для автоматической сводки руководству")
 @app_commands.describe(channel="Канал руководства")
 async def set_leader_channel_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await check_command_permissions(interaction, "set_leader_channel"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, channel.id)
     await interaction.response.send_message(f"✅ Канал {channel.mention} установлен как канал для авто-сводки руководства!", ephemeral=True)
 
 @bot.tree.command(name="settings", description="Посмотреть текущие настройки бота для сервера")
-@app_commands.checks.has_permissions(administrator=True)
 async def settings_cmd(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "settings"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
     max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild_id)
     creator_id, category_id = await asyncio.to_thread(db_get_voice_settings, interaction.guild_id)
@@ -688,9 +794,11 @@ async def settings_cmd(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="admin_panel", description="Заспавнить интерактивную админ-панель (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="admin_panel", description="Заспавнить интерактивную админ-панель")
 async def admin_panel_cmd(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "admin_panel"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     embed = discord.Embed(
         title="🛠️ ПАНЕЛЬ УПРАВЛЕНИЯ КЛАНОМ HATE",
         description="Используйте кнопки ниже для быстрого управления кланом:",
@@ -698,9 +806,11 @@ async def admin_panel_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=AdminPanelView())
 
-@bot.tree.command(name="steam_list", description="Посмотреть список всех привязанных SteamID (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="steam_list", description="Посмотреть список всех привязанных SteamID")
 async def steam_list(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "steam_list"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     steam_data = await asyncio.to_thread(db_get_all_steam_ids)
     if not steam_data:
@@ -711,9 +821,11 @@ async def steam_list(interaction: discord.Interaction):
     embed = discord.Embed(title="📋 Список привязанных SteamID клана", description="\n".join(lines)[:1900], color=discord.Color.blue())
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="notify_no_steam", description="Уведомить игроков с ролью клана, которые ещё не привязали SteamID (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="notify_no_steam", description="Уведомить игроков с ролью клана, которые ещё не привязали SteamID")
 async def notify_no_steam_cmd(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "notify_no_steam"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     steam_data = await asyncio.to_thread(db_get_all_steam_ids)
     linked_ids = {r[0] for r in steam_data}
@@ -739,12 +851,11 @@ async def notify_no_steam_cmd(interaction: discord.Interaction):
         await interaction.channel.send(msg_text)
         await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
     else:
-        await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID (или роль не настроена через `/setup`)!", ephemeral=True)
+        await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
 
 # --- ДИНАМИЧЕСКИЕ ГОЛОСОВЫЕ КАНАЛЫ ---
 
-@bot.tree.command(name="voice_setup", description="Настроить систему динамических голосовых каналов (Админ)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="voice_setup", description="Настроить систему динамических голосовых каналов")
 @app_commands.describe(
     creator_channel="Голосовой канал, при входе в который создается комната",
     category="Категория, в которой будут создаваться приватные комнаты"
@@ -754,6 +865,9 @@ async def voice_setup(
     creator_channel: discord.VoiceChannel, 
     category: discord.CategoryChannel
 ):
+    if not await check_command_permissions(interaction, "voice_setup"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await asyncio.to_thread(db_save_voice_settings, interaction.guild_id, creator_channel.id, category.id)
     embed = discord.Embed(title="⚙️ Динамические голосовые каналы настроены!", color=discord.Color.green())
     embed.add_field(name="Канал-создатель", value=creator_channel.mention, inline=False)
@@ -852,12 +966,14 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
 
 # --- СИСТЕМА ПРЕДУПРЕЖДЕНИЙ (WARNS) ---
 
-warn_group = app_commands.Group(name="warn", description="Управление предупреждениями и банами (Админ)")
+warn_group = app_commands.Group(name="warn", description="Управление предупреждениями и банами")
 
 @warn_group.command(name="add", description="Выдать варн пользователю")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец", reason="Причина предупреждения")
 async def warn_add(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not await check_command_permissions(interaction, "warn_add"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
 
     warn_count = await asyncio.to_thread(db_add_warn, interaction.guild_id, member.id, interaction.user.id, reason)
@@ -888,9 +1004,11 @@ async def warn_add(interaction: discord.Interaction, member: discord.Member, rea
             await interaction.channel.send(f"❌ Не удалось автоматически забанить {member.mention}: {str(e)}")
 
 @warn_group.command(name="remove", description="Снять последнее предупреждение с бойца")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец")
 async def warn_remove(interaction: discord.Interaction, member: discord.Member):
+    if not await check_command_permissions(interaction, "warn_remove"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     success = await asyncio.to_thread(db_remove_warn, interaction.guild_id, member.id)
     if success:
         warns = await asyncio.to_thread(db_get_warns, interaction.guild_id, member.id)
@@ -916,16 +1034,20 @@ async def warn_list(interaction: discord.Interaction, member: discord.Member = N
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @warn_group.command(name="clear", description="Очистить все предупреждения бойца")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец")
 async def warn_clear(interaction: discord.Interaction, member: discord.Member):
+    if not await check_command_permissions(interaction, "warn_clear"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     await asyncio.to_thread(db_clear_warns, interaction.guild_id, member.id)
     await interaction.response.send_message(f"🧹 Все предупреждения бойца {member.mention} успешно очищены.", ephemeral=True)
 
 @warn_group.command(name="set_limit", description="Установить максимальное количество варнов до бана")
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(max_warns="Лимит предупреждений (по умолчанию 3)")
 async def warn_set_limit(interaction: discord.Interaction, max_warns: int):
+    if not await check_command_permissions(interaction, "warn_set_limit"):
+        await interaction.response.send_message("❌ Недостаточно прав!", ephemeral=True)
+        return
     if max_warns <= 0:
         await interaction.response.send_message("❌ Лимит должен быть больше 0!", ephemeral=True)
         return
