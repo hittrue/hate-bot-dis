@@ -337,7 +337,8 @@ class LateReasonModal(discord.ui.Modal, title="Опоздание на вайп"
     async def on_submit(self, interaction: discord.Interaction):
         await asyncio.to_thread(db_save_wipe_response, interaction.user.id, "Опоздает", self.reason.value)
         await interaction.response.send_message("Ваш статус **'Опоздаю'** записан!", ephemeral=True)
-        await update_leader_report(interaction.guild, interaction.client)
+        if interaction.guild:
+            await update_leader_report(interaction.guild, interaction.client)
 
 class AbsentReasonModal(discord.ui.Modal, title="Отсутствие на вайпе"):
     reason = discord.ui.TextInput(
@@ -351,7 +352,8 @@ class AbsentReasonModal(discord.ui.Modal, title="Отсутствие на ва�
     async def on_submit(self, interaction: discord.Interaction):
         await asyncio.to_thread(db_save_wipe_response, interaction.user.id, "Отсутствует", self.reason.value)
         await interaction.response.send_message("Ваш статус **'Не буду'** записан!", ephemeral=True)
-        await update_leader_report(interaction.guild, interaction.client)
+        if interaction.guild:
+            await update_leader_report(interaction.guild, interaction.client)
 
 class WipeView(discord.ui.View):
     def __init__(self):
@@ -361,7 +363,8 @@ class WipeView(discord.ui.View):
     async def attending_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await asyncio.to_thread(db_save_wipe_response, interaction.user.id, "Идет", "Без задержек")
         await interaction.response.send_message("Вы подтвердили участие в вайпе!", ephemeral=True)
-        await update_leader_report(interaction.guild, interaction.client)
+        if interaction.guild:
+            await update_leader_report(interaction.guild, interaction.client)
 
     @discord.ui.button(label="Опоздаю", style=discord.ButtonStyle.secondary, custom_id="wipe_late")
     async def late_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -422,14 +425,15 @@ class AdminWipeModal(discord.ui.Modal, title="📢 Анонс и настрой�
         wipe_data = {
             "datetime": wipe_dt,
             "channel_id": interaction.channel_id,
-            "guild_id": interaction.guild_id,
+            "guild_id": interaction.guild.id if interaction.guild else None,
             "ping_15m_sent": False,
             "wipe_started_sent": False,
             "connect": self.connect_cmd.value
         }
 
-        msg = await interaction.channel.send(embed=embed, view=WipeView())
-        wipe_data["message_id"] = msg.id
+        if interaction.channel:
+            msg = await interaction.channel.send(embed=embed, view=WipeView())
+            wipe_data["message_id"] = msg.id
 
         if not check_wipe_time.is_running():
             check_wipe_time.start()
@@ -449,7 +453,8 @@ class AdminWarnLimitModal(discord.ui.Modal, title="⚙️ Настройка л�
             return
 
         max_w = int(self.limit.value)
-        await asyncio.to_thread(db_set_max_warns, interaction.guild_id, max_w)
+        if interaction.guild:
+            await asyncio.to_thread(db_set_max_warns, interaction.guild.id, max_w)
         await interaction.response.send_message(f"⚙️ Новый лимит варнов для автоматического бана равен `{max_w}`", ephemeral=True)
 
 class SetupSelectView(discord.ui.View):
@@ -458,14 +463,18 @@ class SetupSelectView(discord.ui.View):
 
     @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Выберите основную роль клана...", row=0)
     async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if not interaction.guild:
+            return
         selected_role = select.values[0]
-        await asyncio.to_thread(db_set_clan_role, interaction.guild_id, selected_role.id)
+        await asyncio.to_thread(db_set_clan_role, interaction.guild.id, selected_role.id)
         await interaction.response.send_message(f"✅ Роль клана успешно установлена: {selected_role.mention}", ephemeral=True)
 
     @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="Выберите канал для отчетов руководству...", row=1)
     async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not interaction.guild:
+            return
         selected_channel = select.values[0]
-        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel.id)
+        await asyncio.to_thread(db_set_leader_channel, interaction.guild.id, selected_channel.id)
         await interaction.response.send_message(f"✅ Канал сводки руководства установлен: {selected_channel.mention}", ephemeral=True)
 
 class AdminPanelView(discord.ui.View):
@@ -490,7 +499,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="📣 Пинать неопределившихся", style=discord.ButtonStyle.secondary, custom_id="admin_panel_ping", row=0)
     async def ping_missing(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
+        if not interaction.user.guild_permissions.administrator or not interaction.guild:
             await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
             return
 
@@ -498,7 +507,7 @@ class AdminPanelView(discord.ui.View):
         responses = await asyncio.to_thread(db_get_wipe_responses)
         responded_ids = {r[0] for r in responses}
 
-        config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
+        config = await asyncio.to_thread(db_get_guild_config, interaction.guild.id)
         clan_role_id = config.get("clan_role_id")
 
         missing_mentions = []
@@ -509,7 +518,7 @@ class AdminPanelView(discord.ui.View):
                     if not member.bot and member.id not in responded_ids:
                         missing_mentions.append(member.mention)
 
-        if missing_mentions:
+        if missing_mentions and interaction.channel:
             msg_text = "🚨 **СРОЧНО проголосуйте в анонсе вайпа!**\n" + " ".join(missing_mentions[:30])
             await interaction.channel.send(msg_text)
             await interaction.followup.send(f"✅ Отправлен пинг {len(missing_mentions)} бойцам!", ephemeral=True)
@@ -534,7 +543,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="🔔 Пинг без Steam", style=discord.ButtonStyle.danger, custom_id="admin_panel_notify_no_steam", row=1)
     async def notify_no_steam(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
+        if not interaction.user.guild_permissions.administrator or not interaction.guild:
             await interaction.response.send_message("❌ У вас нет прав администратора!", ephemeral=True)
             return
 
@@ -542,7 +551,7 @@ class AdminPanelView(discord.ui.View):
         steam_data = await asyncio.to_thread(db_get_all_steam_ids)
         linked_ids = {r[0] for r in steam_data}
 
-        config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
+        config = await asyncio.to_thread(db_get_guild_config, interaction.guild.id)
         clan_role_id = config.get("clan_role_id")
 
         unlinked_mentions = []
@@ -553,7 +562,7 @@ class AdminPanelView(discord.ui.View):
                     if not member.bot and member.id not in linked_ids:
                         unlinked_mentions.append(member.mention)
 
-        if unlinked_mentions:
+        if unlinked_mentions and interaction.channel:
             msg_text = (
                 "⚠️ **НАПОМИНАНИЕ О ПРИВЯЗКЕ STEAM** ⚠️\n"
                 "Следующие бойцы клана ещё не привязали свой SteamID в боте:\n"
@@ -592,7 +601,7 @@ class HateClanBot(commands.Bot):
         intents.members = True
         intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
-        self.session = None
+        self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
@@ -626,6 +635,8 @@ async def text_admin_panel(ctx: commands.Context):
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def manual_sync(ctx: commands.Context):
+    if not ctx.guild:
+        return
     msg = await ctx.send("⏳ Выполняется принудительная синхронизация команд...")
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
@@ -647,22 +658,28 @@ async def setup_cmd(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(role="Роль вашего клана")
 async def set_clan_role_cmd(interaction: discord.Interaction, role: discord.Role):
-    await asyncio.to_thread(db_set_clan_role, interaction.guild_id, role.id)
+    if not interaction.guild:
+        return
+    await asyncio.to_thread(db_set_clan_role, interaction.guild.id, role.id)
     await interaction.response.send_message(f"✅ Роль клана успешно установлена: {role.mention}", ephemeral=True)
 
 @bot.tree.command(name="set_leader_channel", description="Назначить канал для автоматической сводки руководству (Админ)")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(channel="Канал руководства")
 async def set_leader_channel_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
-    await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, channel.id)
+    if not interaction.guild:
+        return
+    await asyncio.to_thread(db_set_leader_channel, interaction.guild.id, channel.id)
     await interaction.response.send_message(f"✅ Канал {channel.mention} установлен как канал для авто-сводки руководства!", ephemeral=True)
 
 @bot.tree.command(name="settings", description="Посмотреть текущие настройки бота для сервера")
 @app_commands.checks.has_permissions(administrator=True)
 async def settings_cmd(interaction: discord.Interaction):
-    config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
-    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild_id)
-    creator_id, category_id = await asyncio.to_thread(db_get_voice_settings, interaction.guild_id)
+    if not interaction.guild:
+        return
+    config = await asyncio.to_thread(db_get_guild_config, interaction.guild.id)
+    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild.id)
+    creator_id, category_id = await asyncio.to_thread(db_get_voice_settings, interaction.guild.id)
 
     role_str = f"<@&{config['clan_role_id']}>" if config['clan_role_id'] else "❌ *Не настроена*"
     channel_str = f"<#{config['leader_channel_id']}>" if config['leader_channel_id'] else "❌ *Не настроен*"
@@ -702,11 +719,13 @@ async def steam_list(interaction: discord.Interaction):
 @bot.tree.command(name="notify_no_steam", description="Уведомить игроков с ролью клана, которые ещё не привязали SteamID (Админ)")
 @app_commands.checks.has_permissions(administrator=True)
 async def notify_no_steam_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.channel:
+        return
     await interaction.response.defer(ephemeral=True)
     steam_data = await asyncio.to_thread(db_get_all_steam_ids)
     linked_ids = {r[0] for r in steam_data}
 
-    config = await asyncio.to_thread(db_get_guild_config, interaction.guild_id)
+    config = await asyncio.to_thread(db_get_guild_config, interaction.guild.id)
     clan_role_id = config.get("clan_role_id")
 
     unlinked_mentions = []
@@ -742,7 +761,9 @@ async def voice_setup(
     creator_channel: discord.VoiceChannel, 
     category: discord.CategoryChannel
 ):
-    await asyncio.to_thread(db_save_voice_settings, interaction.guild_id, creator_channel.id, category.id)
+    if not interaction.guild:
+        return
+    await asyncio.to_thread(db_save_voice_settings, interaction.guild.id, creator_channel.id, category.id)
     embed = discord.Embed(title="⚙️ Динамические голосовые каналы настроены!", color=discord.Color.green())
     embed.add_field(name="Канал-создатель", value=creator_channel.mention, inline=False)
     embed.add_field(name="Категория для комнат", value=category.name, inline=False)
@@ -783,6 +804,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 @app_commands.describe(steam_id_or_url="SteamID64, ссылка на профиль или custom URL")
 async def link_steam(interaction: discord.Interaction, steam_id_or_url: str):
     await interaction.response.defer(ephemeral=True)
+    if not bot.session:
+        await interaction.followup.send("❌ Сессия подключения недоступна.", ephemeral=True)
+        return
+
     steam_id = await resolve_steam_id(bot.session, steam_id_or_url)
     
     if not steam_id:
@@ -801,6 +826,10 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
 
     if not steam_id:
         await interaction.followup.send(f"❌ У пользователя {target.mention} не привязан Steam профиль.", ephemeral=True)
+        return
+
+    if not bot.session:
+        await interaction.followup.send("❌ Сессия подключения недоступна.", ephemeral=True)
         return
 
     stats_url = f"http://api.steampowered.com/ISteamUserStats/GetUserStatsForGame/v0002/?appid={RUST_APP_ID}&key={STEAM_API_KEY}&steamid={steam_id}"
@@ -853,10 +882,12 @@ warn_group = app_commands.Group(name="warn", description="Управление �
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец", reason="Причина предупреждения")
 async def warn_add(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not interaction.guild:
+        return
     await interaction.response.defer(ephemeral=True)
 
-    warn_count = await asyncio.to_thread(db_add_warn, interaction.guild_id, member.id, interaction.user.id, reason)
-    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild_id)
+    warn_count = await asyncio.to_thread(db_add_warn, interaction.guild.id, member.id, interaction.user.id, reason)
+    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild.id)
 
     embed = discord.Embed(title="⚠️ Выдано предупреждение", color=discord.Color.orange())
     embed.add_field(name="Боец", value=member.mention, inline=True)
@@ -870,7 +901,7 @@ async def warn_add(interaction: discord.Interaction, member: discord.Member, rea
     except Exception:
         pass
 
-    if warn_count >= max_warns:
+    if warn_count >= max_warns and interaction.channel:
         try:
             await member.ban(reason=f"Превышен лимит предупреждений ({warn_count}/{max_warns}). Последний варн: {reason}")
             ban_embed = discord.Embed(
@@ -886,9 +917,11 @@ async def warn_add(interaction: discord.Interaction, member: discord.Member, rea
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец")
 async def warn_remove(interaction: discord.Interaction, member: discord.Member):
-    success = await asyncio.to_thread(db_remove_warn, interaction.guild_id, member.id)
+    if not interaction.guild:
+        return
+    success = await asyncio.to_thread(db_remove_warn, interaction.guild.id, member.id)
     if success:
-        warns = await asyncio.to_thread(db_get_warns, interaction.guild_id, member.id)
+        warns = await asyncio.to_thread(db_get_warns, interaction.guild.id, member.id)
         await interaction.response.send_message(f"✅ Последнее предупреждение снято с {member.mention}. Осталось варнов: `{len(warns)}`", ephemeral=True)
     else:
         await interaction.response.send_message(f"❌ У пользователя {member.mention} нет активных варнов.", ephemeral=True)
@@ -896,9 +929,11 @@ async def warn_remove(interaction: discord.Interaction, member: discord.Member):
 @warn_group.command(name="list", description="Посмотреть список варнов бойца")
 @app_commands.describe(member="Боец (по умолчанию вы)")
 async def warn_list(interaction: discord.Interaction, member: discord.Member = None):
+    if not interaction.guild:
+        return
     target = member or interaction.user
-    warns = await asyncio.to_thread(db_get_warns, interaction.guild_id, target.id)
-    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild_id)
+    warns = await asyncio.to_thread(db_get_warns, interaction.guild.id, target.id)
+    max_warns = await asyncio.to_thread(db_get_max_warns, interaction.guild.id)
 
     if not warns:
         await interaction.response.send_message(f"✅ У {target.mention} нет предупреждений.", ephemeral=True)
@@ -914,17 +949,21 @@ async def warn_list(interaction: discord.Interaction, member: discord.Member = N
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(member="Боец")
 async def warn_clear(interaction: discord.Interaction, member: discord.Member):
-    await asyncio.to_thread(db_clear_warns, interaction.guild_id, member.id)
+    if not interaction.guild:
+        return
+    await asyncio.to_thread(db_clear_warns, interaction.guild.id, member.id)
     await interaction.response.send_message(f"🧹 Все предупреждения бойца {member.mention} успешно очищены.", ephemeral=True)
 
 @warn_group.command(name="set_limit", description="Установить максимальное количество варнов до бана")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(max_warns="Лимит предупреждений (по умолчанию 3)")
 async def warn_set_limit(interaction: discord.Interaction, max_warns: int):
+    if not interaction.guild:
+        return
     if max_warns <= 0:
         await interaction.response.send_message("❌ Лимит должен быть больше 0!", ephemeral=True)
         return
-    await asyncio.to_thread(db_set_max_warns, interaction.guild_id, max_warns)
+    await asyncio.to_thread(db_set_max_warns, interaction.guild.id, max_warns)
     await interaction.response.send_message(f"⚙️ Новый лимит варнов для бана установлен: `{max_warns}`", ephemeral=True)
 
 bot.tree.add_command(warn_group)
@@ -946,9 +985,9 @@ async def check_wipe_time():
         wipe_data["ping_15m_sent"] = True
         channel = bot.get_channel(wipe_data["channel_id"])
         
-        if channel:
+        if channel and isinstance(channel, discord.TextChannel):
             guild_id = wipe_data.get("guild_id")
-            config = await asyncio.to_thread(db_get_guild_config, guild_id)
+            config = await asyncio.to_thread(db_get_guild_config, guild_id) if guild_id else {}
             clan_role_id = config.get("clan_role_id")
             
             role_mention = f"<@&{clan_role_id}>" if clan_role_id else "@everyone"
@@ -966,7 +1005,7 @@ async def check_wipe_time():
         wipe_data["wipe_started_sent"] = True
         
         channel = bot.get_channel(wipe_data["channel_id"])
-        if channel:
+        if channel and isinstance(channel, discord.TextChannel):
             try:
                 msg = await channel.fetch_message(wipe_data["message_id"])
                 embed = msg.embeds[0]
@@ -981,7 +1020,7 @@ async def check_wipe_time():
             leader_channel_id = config.get("leader_channel_id")
             if leader_channel_id:
                 leader_channel = bot.get_channel(leader_channel_id)
-                if leader_channel:
+                if leader_channel and isinstance(leader_channel, discord.TextChannel):
                     final_embed = await build_report_embed(is_final=True)
                     await leader_channel.send(content="🔔 **ВАЙП НАЧАЛСЯ! Итоговая сводка по готовности состава:**", embed=final_embed)
 
