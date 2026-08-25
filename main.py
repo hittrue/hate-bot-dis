@@ -689,11 +689,29 @@ class HateClanBot(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.add_view(WipeView())
         self.add_view(AdminPanelView())
+        self.change_status_task.start()
 
     async def close(self):
+        if self.change_status_task.is_running():
+            self.change_status_task.cancel()
         if self.session:
             await self.session.close()
         await super().close()
+
+    @tasks.loop(seconds=30)
+    async def change_status_task(self):
+        statuses = [
+            discord.Activity(type=discord.ActivityType.competing, name="HATE'ит противников"),
+            discord.Game(name="Rust"),
+            discord.CustomActivity(name="⛏️ Фармит серу")
+        ]
+        for status in statuses:
+            await self.change_presence(activity=status)
+            await asyncio.sleep(30)
+
+    @change_status_task.before_loop
+    async def before_status_task(self):
+        await self.wait_until_ready()
 
 bot = HateClanBot()
 
