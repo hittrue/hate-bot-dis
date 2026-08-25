@@ -288,6 +288,8 @@ def db_get_allowed_roles_for_command(guild_id: int, command_name: str) -> list[i
     return [r[0] for r in rows]
 
 async def check_command_permissions(interaction: discord.Interaction, command_name: str) -> bool:
+    if not interaction.guild:
+        return False
     if interaction.user.guild_permissions.administrator:
         return True
     
@@ -329,11 +331,14 @@ async def resolve_steam_id(session: aiohttp.ClientSession, input_str: str) -> st
         return None
 
     url = f"http://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/?key={STEAM_API_KEY}&vanityurl={vanity_url}"
-    async with session.get(url) as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            if data.get("response", {}).get("success") == 1:
-                return data["response"]["steamid"]
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("response", {}).get("success") == 1:
+                    return data["response"]["steamid"]
+    except Exception:
+        pass
     return None
 
 async def build_report_embed(is_final: bool = False) -> discord.Embed:
@@ -366,18 +371,23 @@ async def build_report_embed(is_final: bool = False) -> discord.Embed:
     return embed
 
 async def update_leader_report(guild: discord.Guild, bot: commands.Bot):
+    if not guild:
+        return
     config = await asyncio.to_thread(db_get_guild_config, guild.id)
     leader_channel_id = config.get("leader_channel_id")
     if not leader_channel_id:
         return
     channel = guild.get_channel(leader_channel_id)
-    if channel:
+    if channel and isinstance(channel, discord.TextChannel):
         embed = await build_report_embed(is_final=False)
-        async for msg in channel.history(limit=5):
-            if msg.author == bot.user and msg.embeds and "Отчет готовности" in msg.embeds[0].title:
-                await msg.edit(embed=embed)
-                return
-        await channel.send(embed=embed)
+        try:
+            async for msg in channel.history(limit=5):
+                if msg.author == bot.user and msg.embeds and "Отчет готовности" in msg.embeds[0].title:
+                    await msg.edit(embed=embed)
+                    return
+            await channel.send(embed=embed)
+        except Exception:
+            pass
 
 async def process_steam_list(interaction: discord.Interaction):
     steam_data = await asyncio.to_thread(db_get_all_steam_ids)
@@ -397,7 +407,7 @@ async def process_notify_no_steam(interaction: discord.Interaction):
     clan_role_id = config.get("clan_role_id")
 
     unlinked_mentions = []
-    if clan_role_id:
+    if clan_role_id and interaction.guild:
         role = interaction.guild.get_role(clan_role_id)
         if role:
             for member in role.members:
@@ -411,7 +421,8 @@ async def process_notify_no_steam(interaction: discord.Interaction):
             + " ".join(unlinked_mentions[:30]) +
             "\n\nПожалуйста, напишите команду `/link <ваш_steamid_или_ссылка>` прямо сейчас!"
         )
-        await interaction.channel.send(msg_text)
+        if isinstance(interaction.channel, discord.TextChannel):
+            await interaction.channel.send(msg_text)
         await interaction.followup.send(f"✅ Напоминание отправлено {len(unlinked_mentions)} бойцам!", ephemeral=True)
     else:
         await interaction.followup.send("✅ Все участники клана с ролью уже привязали SteamID!", ephemeral=True)
@@ -448,23 +459,49 @@ class AbsentReasonModal(discord.ui.Modal, title="Отсутствие на ва�
         await interaction.response.send_message("Ваш статус **'Не буду'** записан!", ephemeral=True)
         await update_leader_report(interaction.guild, interaction.client)
 
+class AdminSelectChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Выберите канал для авто-сводки руководства..."
+    )
+    async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Только администратор может выбирать канал!", ephemeral=True)
+            return
+
+        selected_channel = select.values[0]
+        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel.id)
+        await interaction.response.send_message(f"✅ Канал сводки руководства изменен на: {selected_channel.mention}", ephemeral=True)
+        await update_leader_report(interaction.guild, interaction.client)
+
 class WipeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Буду на вайпе", style=discord.ButtonStyle.success, custom_id="wipe_attending")
+    @discord.ui.button(label="Буду на вайпе", style=discord.ButtonStyle.success, custom_id="wipe_attending", row=0)
     async def attending_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await asyncio.to_thread(db_save_wipe_response, interaction.user.id, "Идет", "Без задержек")
         await interaction.response.send_message("Вы подтвердили участие в вайпе!", ephemeral=True)
         await update_leader_report(interaction.guild, interaction.client)
 
-    @discord.ui.button(label="Опоздаю", style=discord.ButtonStyle.secondary, custom_id="wipe_late")
+    @discord.ui.button(label="Опоздаю", style=discord.ButtonStyle.secondary, custom_id="wipe_late", row=0)
     async def late_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(LateReasonModal())
 
-    @discord.ui.button(label="Не буду", style=discord.ButtonStyle.danger, custom_id="wipe_absent")
+    @discord.ui.button(label="Не буду", style=discord.ButtonStyle.danger, custom_id="wipe_absent", row=0)
     async def absent_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AbsentReasonModal())
+
+    @discord.ui.button(label="📢 Выбрать канал отчета (Админ)", style=discord.ButtonStyle.primary, custom_id="wipe_select_channel", row=1)
+    async def select_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Данное действие доступно только администратору!", ephemeral=True)
+            return
+        await interaction.response.send_message("Выберите канал, в который будет выводиться сводка явки:", view=AdminSelectChannelView(), ephemeral=True)
 
 class AdminWipeModal(discord.ui.Modal, title="📢 Анонс и настройка вайпа"):
     connect_cmd = discord.ui.TextInput(
@@ -523,8 +560,9 @@ class AdminWipeModal(discord.ui.Modal, title="📢 Анонс и настрой�
             "connect": self.connect_cmd.value
         }
 
-        msg = await interaction.channel.send(embed=embed, view=WipeView())
-        wipe_data["message_id"] = msg.id
+        if isinstance(interaction.channel, discord.TextChannel):
+            msg = await interaction.channel.send(embed=embed, view=WipeView())
+            wipe_data["message_id"] = msg.id
 
         if not check_wipe_time.is_running():
             check_wipe_time.start()
@@ -626,7 +664,7 @@ class AdminPanelView(discord.ui.View):
         clan_role_id = config.get("clan_role_id")
 
         missing_mentions = []
-        if clan_role_id:
+        if clan_role_id and interaction.guild:
             role = interaction.guild.get_role(clan_role_id)
             if role:
                 for member in role.members:
@@ -635,7 +673,8 @@ class AdminPanelView(discord.ui.View):
 
         if missing_mentions:
             msg_text = "🚨 **СРОЧНО проголосуйте в анонсе вайпа!**\n" + " ".join(missing_mentions[:30])
-            await interaction.channel.send(msg_text)
+            if isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.send(msg_text)
             await interaction.followup.send(f"✅ Отправлен пинг {len(missing_mentions)} бойцам!", ephemeral=True)
         else:
             await interaction.followup.send("✅ Все бойцы уже проголосовали или роль клана еще не настроена через `/setup`!", ephemeral=True)
@@ -719,15 +758,6 @@ bot = HateClanBot()
 async def on_ready():
     init_db()
     print(f"Бот {bot.user} успешно запущен!")
-    
-    try:
-        for guild in bot.guilds:
-            print(f"Синхронизация слэш-команд для сервера: {guild.name} ({guild.id})...")
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"✅ Успешно синхронизировано {len(synced)} команд на сервере {guild.name}!")
-    except Exception as e:
-        print(f"❌ Ошибка синхронизации команд: {e}")
 
 # --- ТЕКСТОВЫЕ АДМИН-КОМАНДЫ ---
 
@@ -744,6 +774,8 @@ async def text_admin_panel(ctx: commands.Context):
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def manual_sync(ctx: commands.Context):
+    if not ctx.guild:
+        return
     msg = await ctx.send("⏳ Выполняется принудительная синхронизация команд...")
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
@@ -803,7 +835,8 @@ async def settings_cmd(interaction: discord.Interaction):
     channel_str = f"<#{config['leader_channel_id']}>" if config['leader_channel_id'] else "❌ *Не настроен*"
     voice_str = f"<#{creator_id}>" if creator_id else "❌ *Не настроены*"
 
-    embed = discord.Embed(title=f"⚙️ Настройки бота | {interaction.guild.name}", color=discord.Color.gold())
+    guild_name = interaction.guild.name if interaction.guild else "Сервер"
+    embed = discord.Embed(title=f"⚙️ Настройки бота | {guild_name}", color=discord.Color.gold())
     embed.add_field(name="Роль клана", value=role_str, inline=False)
     embed.add_field(name="Канал сводки руководству", value=channel_str, inline=False)
     embed.add_field(name="Динамические голосовые", value=voice_str, inline=False)
@@ -945,7 +978,8 @@ async def warn_add(interaction: discord.Interaction, member: discord.Member, rea
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     try:
-        await member.send(f"⚠️ Вам выдано предупреждение на сервере **{interaction.guild.name}**.\n**Причина:** {reason}\n**Всего варнов:** {warn_count}/{max_warns}")
+        guild_name = interaction.guild.name if interaction.guild else "сервере"
+        await member.send(f"⚠️ Вам выдано предупреждение на сервере **{guild_name}**.\n**Причина:** {reason}\n**Всего варнов:** {warn_count}/{max_warns}")
     except Exception:
         pass
 
@@ -957,9 +991,11 @@ async def warn_add(interaction: discord.Interaction, member: discord.Member, rea
                 description=f"Игрок {member.mention} был забанен за достижение лимита варнов (`{warn_count}/{max_warns}`).",
                 color=discord.Color.red()
             )
-            await interaction.channel.send(embed=ban_embed)
+            if isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.send(embed=ban_embed)
         except Exception as e:
-            await interaction.channel.send(f"❌ Не удалось автоматически забанить {member.mention}: {str(e)}")
+            if isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.send(f"❌ Не удалось автоматически забанить {member.mention}: {str(e)}")
 
 @warn_group.command(name="remove", description="Снять последнее предупреждение с бойца")
 @app_commands.describe(member="Боец")
@@ -1031,7 +1067,7 @@ async def check_wipe_time():
         wipe_data["ping_15m_sent"] = True
         channel = bot.get_channel(wipe_data["channel_id"])
         
-        if channel:
+        if channel and isinstance(channel, discord.TextChannel):
             guild_id = wipe_data.get("guild_id")
             config = await asyncio.to_thread(db_get_guild_config, guild_id)
             clan_role_id = config.get("clan_role_id")
@@ -1051,7 +1087,7 @@ async def check_wipe_time():
         wipe_data["wipe_started_sent"] = True
         
         channel = bot.get_channel(wipe_data["channel_id"])
-        if channel:
+        if channel and isinstance(channel, discord.TextChannel):
             try:
                 msg = await channel.fetch_message(wipe_data["message_id"])
                 embed = msg.embeds[0]
@@ -1066,7 +1102,7 @@ async def check_wipe_time():
             leader_channel_id = config.get("leader_channel_id")
             if leader_channel_id:
                 leader_channel = bot.get_channel(leader_channel_id)
-                if leader_channel:
+                if leader_channel and isinstance(leader_channel, discord.TextChannel):
                     final_embed = await build_report_embed(is_final=True)
                     await leader_channel.send(content="🔔 **ВАЙП НАЧАЛСЯ! Итоговая сводка по готовности состава:**", embed=final_embed)
 
@@ -1077,13 +1113,14 @@ async def check_wipe_time():
     app_commands.Choice(name="Патрон 5.56 (Разрывной)", value="explosive_ammo")
 ])
 @app_commands.describe(amount="Количество предметов")
-async def craft_calc(interaction: discord.Interaction, item: str, amount: int = 1):
+async def craft_calc(interaction: discord.Interaction, item: app_commands.Choice[str], amount: int = 1):
     if amount <= 0:
         await interaction.response.send_message("Количество должно быть больше 0!", ephemeral=True)
         return
 
+    item_val = item.value
     res = {}
-    if item == "c4":
+    if item_val == "c4":
         explosives = 20 * amount
         res = {
             "Сера (Всего)": (explosives * 10) + (explosives * 50 * 2),
@@ -1095,7 +1132,7 @@ async def craft_calc(interaction: discord.Interaction, item: str, amount: int = 
         }
         title = f"💣 Расчет ресурсов для крафта: {amount}x C4"
 
-    elif item == "rocket":
+    elif item_val == "rocket":
         explosives = 10 * amount
         extra_gunpowder = 150 * amount
         total_gp = (explosives * 50) + extra_gunpowder
@@ -1108,7 +1145,7 @@ async def craft_calc(interaction: discord.Interaction, item: str, amount: int = 
         }
         title = f"🚀 Расчет ресурсов для крафта: {amount}x Ракета"
 
-    elif item == "explosive_ammo":
+    elif item_val == "explosive_ammo":
         crafts = (amount + 1) // 2
         gp = 10 * crafts
         res = {
@@ -1132,7 +1169,7 @@ async def craft_calc(interaction: discord.Interaction, item: str, amount: int = 
     app_commands.Choice(name="МВК стена (Armored)", value="armored"),
     app_commands.Choice(name="Гаражная дверь", value="garage")
 ])
-async def raid_calc(interaction: discord.Interaction, target: str):
+async def raid_calc(interaction: discord.Interaction, target: app_commands.Choice[str]):
     raid_costs = {
         "wood": "🪵 **Деревянная стена / Дверь:**\n• 1 C4 | 1 Ракета | 18 Разрывных патронов | 2 Бобовые мины",
         "stone": "🪨 **Каменная стена:**\n• 2 C4 | 4 Ракеты | 185 Разрывных патронов | 10 Бобовых мин",
@@ -1143,7 +1180,7 @@ async def raid_calc(interaction: discord.Interaction, target: str):
 
     embed = discord.Embed(
         title="💥 Варианты выноса конструкции",
-        description=raid_costs.get(target, "Данные не найдены"),
+        description=raid_costs.get(target.value, "Данные не найдены"),
         color=discord.Color.red()
     )
     await interaction.response.send_message(embed=embed)
