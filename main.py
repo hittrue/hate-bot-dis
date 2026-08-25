@@ -396,7 +396,12 @@ async def process_steam_list(interaction: discord.Interaction):
         return
 
     lines = [f"<@{discord_id}> — `{steam_id}`" for discord_id, steam_id in steam_data]
-    embed = discord.Embed(title="📋 Список привязанных SteamID клана", description="\n".join(lines)[:1900], color=discord.Color.blue())
+    full_text = "\n".join(lines)
+    embed = discord.Embed(
+        title="📋 Список привязанных SteamID клана", 
+        description=full_text[:3900] + ("\n..." if len(full_text) > 3900 else ""), 
+        color=discord.Color.blue()
+    )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 async def process_notify_no_steam(interaction: discord.Interaction):
@@ -462,19 +467,23 @@ class AbsentReasonModal(discord.ui.Modal, title="Отсутствие на ва�
 class AdminSelectChannelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
+        select = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="Выберите канал для авто-сводки руководства..."
+        )
+        select.callback = self.select_channel
+        self.add_item(select)
 
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="Выберите канал для авто-сводки руководства..."
-    )
-    async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+    async def select_channel(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ Только администратор может выбирать канал!", ephemeral=True)
             return
 
-        selected_channel = select.values[0]
-        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel.id)
+        select_obj: discord.ui.ChannelSelect = interaction.data["values"]
+        selected_channel_id = int(select_obj[0])
+        selected_channel = interaction.guild.get_channel(selected_channel_id)
+
+        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel_id)
         await interaction.response.send_message(f"✅ Канал сводки руководства изменен на: {selected_channel.mention}", ephemeral=True)
         await update_leader_report(interaction.guild, interaction.client)
 
@@ -611,22 +620,37 @@ class CommandRoleManagerView(discord.ui.View):
 class SetupSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
+        
+        # 1. Выбор роли клана
+        role_select = discord.ui.RoleSelect(placeholder="Выберите основную роль клана...", row=0)
+        role_select.callback = self.select_role
+        self.add_item(role_select)
 
-    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Выберите основную роль клана...", row=0)
-    async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        selected_role = select.values[0]
-        await asyncio.to_thread(db_set_clan_role, interaction.guild_id, selected_role.id)
-        await interaction.response.send_message(f"✅ Роль клана успешно установлена: {selected_role.mention}", ephemeral=True)
+        # 2. Выбор канала
+        channel_select = discord.ui.ChannelSelect(channel_types=[discord.ChannelType.text], placeholder="Выберите канал для отчетов руководству...", row=1)
+        channel_select.callback = self.select_channel
+        self.add_item(channel_select)
 
-    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text], placeholder="Выберите канал для отчетов руководству...", row=1)
-    async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        selected_channel = select.values[0]
-        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, selected_channel.id)
-        await interaction.response.send_message(f"✅ Канал сводки руководства установлен: {selected_channel.mention}", ephemeral=True)
+        # 3. Выбор роли для прав
+        perm_role_select = discord.ui.RoleSelect(placeholder="Настроить доступ к командам для роли...", row=2)
+        perm_role_select.callback = self.select_permission_role
+        self.add_item(perm_role_select)
 
-    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Настроить доступ к командам для роли...", row=2)
-    async def select_permission_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        target_role = select.values[0]
+    async def select_role(self, interaction: discord.Interaction):
+        selected_role = interaction.data["values"][0]
+        role = interaction.guild.get_role(int(selected_role))
+        await asyncio.to_thread(db_set_clan_role, interaction.guild_id, role.id)
+        await interaction.response.send_message(f"✅ Роль клана успешно установлена: {role.mention}", ephemeral=True)
+
+    async def select_channel(self, interaction: discord.Interaction):
+        selected_channel_id = int(interaction.data["values"][0])
+        channel = interaction.guild.get_channel(selected_channel_id)
+        await asyncio.to_thread(db_set_leader_channel, interaction.guild_id, channel.id)
+        await interaction.response.send_message(f"✅ Канал сводки руководства установлен: {channel.mention}", ephemeral=True)
+
+    async def select_permission_role(self, interaction: discord.Interaction):
+        selected_role_id = int(interaction.data["values"][0])
+        target_role = interaction.guild.get_role(selected_role_id)
         view = CommandRoleManagerView(target_role)
         await interaction.response.send_message(f"⚙️ Управление правами для роли {target_role.mention}:", view=view, ephemeral=True)
 
@@ -1105,6 +1129,10 @@ async def check_wipe_time():
                 if leader_channel and isinstance(leader_channel, discord.TextChannel):
                     final_embed = await build_report_embed(is_final=True)
                     await leader_channel.send(content="🔔 **ВАЙП НАЧАЛСЯ! Итоговая сводка по готовности состава:**", embed=final_embed)
+
+@check_wipe_time.before_loop
+async def before_check_wipe_time():
+    await bot.wait_until_ready()
 
 @bot.tree.command(name="craft", description="Калькулятор ресурсов для крафта предметов в Rust")
 @app_commands.choices(item=[
